@@ -1,0 +1,12 @@
+[Unit]
+Description=Rebind hci_bcm4377 until Bluetooth powers on (BCM4377 T2 Mac workaround)
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bt-bcm4377-rebind
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

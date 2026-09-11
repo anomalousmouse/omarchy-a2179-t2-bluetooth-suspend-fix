@@ -1,0 +1,57 @@
+#!/bin/bash
+# Workaround for BCM4377 Bluetooth on T2 Macs (MacBookAir9,1 and similar).
+# The chip's Bluetooth firmware often fails its first initialisation after boot
+# (HCI command timeouts, or probe error -110). Unbinding and rebinding the
+# hci_bcm4377 PCI driver, sometimes more than once, brings it up.
+#
+# Exit 0 as soon as bluez reports the controller powered on.
+
+set -u
+
+MAX_TRIES=${MAX_TRIES:-5}
+DRV=/sys/bus/pci/drivers/hci_bcm4377
+
+# Locate the Bluetooth function: Broadcom vendor 0x14e4, device 0x5fa0 (BCM4377).
+DEV=""
+for d in /sys/bus/pci/devices/*; do
+    if [ "$(cat "$d/vendor" 2>/dev/null)" = "0x14e4" ] && [ "$(cat "$d/device" 2>/dev/null)" = "0x5fa0" ]; then
+        DEV=$(basename "$d")
+        break
+    fi
+done
+if [ -z "$DEV" ]; then
+    echo "bt-bcm4377-rebind: no BCM4377 Bluetooth function found, nothing to do"
+    exit 0
+fi
+
+modprobe hci_bcm4377 2>/dev/null || true
+
+powered() {
+    [ -e /sys/class/bluetooth/hci0 ] || return 1
+    timeout 5 bluetoothctl power on >/dev/null 2>&1
+    timeout 5 bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'
+}
+
+if powered; then
+    echo "bt-bcm4377-rebind: $DEV already powered, nothing to do"
+    exit 0
+fi
+
+for i in $(seq 1 "$MAX_TRIES"); do
+    echo "bt-bcm4377-rebind: attempt $i/$MAX_TRIES on $DEV"
+    if [ -L "/sys/bus/pci/devices/$DEV/driver" ]; then
+        echo "$DEV" > "$DRV/unbind" 2>/dev/null || true
+        sleep 2
+    fi
+    echo "$DEV" > "$DRV/bind" 2>/dev/null || true
+    sleep 3
+    systemctl restart bluetooth.service
+    sleep 3
+    if powered; then
+        echo "bt-bcm4377-rebind: Bluetooth powered on after attempt $i"
+        exit 0
+    fi
+done
+
+echo "bt-bcm4377-rebind: gave up after $MAX_TRIES attempts"
+exit 1
