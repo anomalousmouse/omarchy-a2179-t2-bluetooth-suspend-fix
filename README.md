@@ -83,13 +83,13 @@ driver (e.g. other 2020 MacBook Air/Pro models), though the PCI address may diff
 the script auto-detects the device by PCI vendor/device ID (`14e4:5fa0`), so it should
 work unmodified on those too.
 
-## Not included here
+## Suspend/resume
 
-Suspend/resume is separately broken on this machine (`brcmfmac` fails to enter D3, deep
-suspend aborts). A workaround was drafted but not verified safe — an early version
-caused a PCIe AER failure that took Wi-Fi and Bluetooth both offline until reboot. Left
-out until confirmed working; see the [Omarchy discussion #5862](https://github.com/basecamp/omarchy/discussions/5862)
-for related suspend/resume unbind-bind units if you want to try that yourself.
+Suspend is separately broken on this machine (`brcmfmac` fails to enter D3, so every
+suspend aborts). That fix lives in its own repo:
+[omarchy-a2179-t2-suspend-fix](https://github.com/austinsomer/omarchy-a2179-t2-suspend-fix).
+It unloads the Wi-Fi and Bluetooth drivers before sleep and uses this repo's
+`bt-bcm4377-rebind.service` to bring Bluetooth back after wake, so install this fix first.
 
 ## Sources
 
