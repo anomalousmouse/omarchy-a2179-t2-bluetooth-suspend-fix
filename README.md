@@ -46,7 +46,7 @@ until bluez reports the controller powered on.
 ### Install
 
 ```bash
-git clone https://github.com/<your-username>/omarchy-a2179-t2-bluetooth-fix.git
+git clone https://github.com/austinsomer/omarchy-a2179-t2-bluetooth-fix.git
 cd omarchy-a2179-t2-bluetooth-fix/bt-bcm4377-fix
 sudo install -m 755 bt-bcm4377-rebind /usr/local/bin/bt-bcm4377-rebind
 sudo install -m 644 bt-bcm4377-rebind.service /etc/systemd/system/bt-bcm4377-rebind.service
