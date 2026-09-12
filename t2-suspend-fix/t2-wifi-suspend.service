@@ -1,0 +1,17 @@
+[Unit]
+Description=Unload BCM4377 Wi-Fi and Bluetooth around suspend
+Documentation=https://github.com/austinsomer/omarchy-a2179-t2-bluetooth-suspend-fix
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=15
+TimeoutStopSec=15
+SyslogIdentifier=t2-wifi-suspend
+ExecStart=/usr/local/sbin/t2-wifi-suspend pre
+ExecStop=/usr/local/sbin/t2-wifi-suspend post
+
+[Install]
+WantedBy=sleep.target

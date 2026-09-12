@@ -87,9 +87,24 @@ Tested by hand:
 This is why the shipped fix retries the unbind/bind cycle up to 5 times rather than
 doing it once.
 
-Known weakness: the script's "already powered" check trusts bluez, which can keep reporting
-`Powered: yes` while the chip has stopped responding. At boot this hasn't mattered. After
-suspend it did (see Part 2), which is why the suspend hook unloads the driver first.
+Known weakness, now fixed: the original "already powered" check trusted bluez, which can
+keep reporting `Powered: yes` while the chip has stopped responding. That is not only a
+post-suspend problem. On a later MacBookAir9,1 boot the adapter came up as:
+
+```
+Class: 0x00000000 (0)
+Powered: yes
+Discovering: no
+```
+
+with `hci0: command 0x0c56 tx timeout` / `Opcode 0x200b failed: -110` (LE Set Scan
+Parameters) and `bluetoothctl scan on` finding zero devices. The oneshot saw `Powered: yes`
+and exited. A single unbind/bind then set class to `0x006c010c` and a scan found dozens of
+devices.
+
+The script now treats `Class: 0x00000000` as down, even when BlueZ says powered. Unloading
+the driver before suspend is still required so a hung function cannot raise a PCIe error
+(see Part 2).
 
 ### If the Bluetooth fix doesn't work for you
 
@@ -203,6 +218,26 @@ Verified: lid closed, about 6 minutes of deep sleep, lid opened. Afterward there
 or DPC errors, the Bluetooth rebind succeeded on its first attempt, Wi-Fi passed traffic, and
 a Bluetooth scan found 14 devices.
 
+### v4: do the unload before sleep.target
+
+v3 was a systemd-sleep hook. That runs *after* user.slice is frozen, so NetworkManager
+cannot be told to release the interface and `modprobe -r brcmfmac` can fail. A machine that
+already had a `WantedBy=sleep.target` unloader for the same chip (disconnect NM, then
+`modprobe -r`) also raced v3 on resume: the other unit's `ExecStop` reloaded `brcmfmac`
+immediately, which is the v1 crash path.
+
+v4 keeps the v3 unload set and 15s delayed reload, but moves the work to a oneshot
+`Before=sleep.target`:
+
+1. Stop `bluetooth.service` and unload `hci_bcm4377` (bluetoothd otherwise holds the module).
+2. `nmcli device disconnect` / `ip link set down` on the `brcmfmac` iface.
+3. Retry `modprobe -r brcmfmac_wcc brcmfmac` up to five times.
+4. On resume, `systemd-run --on-active=15s` to reload Wi-Fi and start
+   `bt-bcm4377-rebind.service`.
+
+If you already have another `sleep.target` Wi-Fi unloader, disable it. Two resume paths
+will fight.
+
 ### If the suspend fix doesn't work for you
 
 Check how far the cycle got:
@@ -217,8 +252,9 @@ journalctl -b -u t2-wifi-reload -u bt-bcm4377-rebind --no-pager
   your machine and needs the same unload/reload treatment.
 - `AER` / `DPC` from `73:00.x` after wake: one of the chip's functions resumed in a bad state.
   Try a longer delay (raise `--on-active=15`).
-- Crash on wake with no logs: same as v1 above. Check the hook is installed and is the v3
-  version with the delay.
+- Crash on wake with no logs: same as v1 above. Check `t2-wifi-suspend.service` is enabled
+  and that no other unit reloads `brcmfmac` immediately on resume. Remove any leftover
+  `/usr/lib/systemd/system-sleep/t2-wifi-suspend` hook from v3.
 
 If you file upstream with [t2linux](https://github.com/t2linux), include:
 

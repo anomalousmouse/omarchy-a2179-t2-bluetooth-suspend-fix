@@ -1,18 +1,100 @@
 #!/bin/bash
-# systemd-sleep hook for BCM4377 on T2 Macs (MacBookAir9,1).
-# brcmfmac times out entering D3 (error -5), which aborts every suspend.
-# hci_bcm4377 survives suspend but its function comes back hung and later
-# raises a PCIe error that takes the whole chip (Wi-Fi too) offline.
-# Unload both before sleep; reload ~15s after wake, since an instant reload
-# crashed the machine.
+# Cycle the BCM4377 combo chip around suspend on T2 Macs (PCI 14e4:4488 Wi-Fi,
+# 14e4:5fa0 Bluetooth).
+#
+# brcmfmac times out in brcmf_pcie_pm_enter_D3 (pci_pm_suspend returns -5),
+# which aborts both deep and s2idle. Unload has to happen before sleep.target:
+# a systemd-sleep hook runs after user.slice is frozen, when NetworkManager
+# still holds the interface and `modprobe -r brcmfmac` can fail.
+#
+# hci_bcm4377 must be unloaded too. Left bound, it wakes hung and later raises
+# a PCIe error that DPC-isolates the whole combo chip (Wi-Fi dies until reboot).
+# Stop bluetoothd first so the module can actually leave.
+#
+# Reloading brcmfmac the instant the system wakes has hard-crashed this model.
+# Defer that reload ~15s, then rebind Bluetooth.
 
-case "$1" in
-  pre)
-    modprobe -r brcmfmac_wcc brcmfmac hci_bcm4377
-    ;;
-  post)
-    systemd-run --collect --on-active=15 --unit=t2-wifi-reload \
-      /bin/sh -c 'modprobe brcmfmac; systemctl start bt-bcm4377-rebind.service'
+has_bcm4377b() {
+  local dev
+  for dev in /sys/bus/pci/devices/*; do
+    [[ -r $dev/vendor && -r $dev/device ]] || continue
+    [[ $(<"$dev/vendor") == 0x14e4 && $(<"$dev/device") == 0x4488 ]] && return 0
+  done
+  return 1
+}
+
+loaded() {
+  [[ -d /sys/module/$1 ]]
+}
+
+wifi_ifaces() {
+  local path driver
+  for path in /sys/class/net/*/device/driver; do
+    [[ -e $path ]] || continue
+    driver=$(basename "$(readlink -f "$path")")
+    [[ $driver == brcmfmac ]] || continue
+    basename "$(dirname "$(dirname "$path")")"
+  done
+}
+
+release_wifi() {
+  local iface
+  for iface in $(wifi_ifaces); do
+    if command -v nmcli >/dev/null 2>&1; then
+      nmcli device disconnect "$iface" >/dev/null 2>&1 || true
+    fi
+    ip link set "$iface" down >/dev/null 2>&1 || true
+  done
+}
+
+unload_bluetooth() {
+  loaded hci_bcm4377 || return 0
+  systemctl stop bluetooth.service >/dev/null 2>&1 || true
+  modprobe -r hci_bcm4377 || true
+  if loaded hci_bcm4377; then
+    echo "warning: failed to unload hci_bcm4377" >&2
+  else
+    echo "unloaded hci_bcm4377 before suspend"
+  fi
+}
+
+pre() {
+  has_bcm4377b || exit 0
+
+  unload_bluetooth
+
+  loaded brcmfmac || exit 0
+
+  release_wifi
+
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    loaded brcmfmac_wcc && modprobe -r brcmfmac_wcc || true
+    if ! loaded brcmfmac || modprobe -r brcmfmac; then
+      echo "unloaded brcmfmac before suspend (attempt $attempt)"
+      exit 0
+    fi
+    sleep 0.4
+  done
+
+  echo "failed to unload brcmfmac; BCM4377b will abort suspend" >&2
+  exit 1
+}
+
+post() {
+  has_bcm4377b || exit 0
+
+  systemctl stop t2-wifi-reload.service t2-wifi-reload.timer >/dev/null 2>&1 || true
+  systemd-run --collect --on-active=15s --unit=t2-wifi-reload \
+    /bin/bash -c 'modprobe brcmfmac; modprobe brcmfmac_wcc || true; systemctl start bt-bcm4377-rebind.service'
+  echo "scheduled brcmfmac/bluetooth reload in 15s"
+}
+
+case "${1:-}" in
+  pre) pre ;;
+  post) post ;;
+  *)
+    echo "usage: ${0##*/} pre|post" >&2
+    exit 2
     ;;
 esac
-exit 0

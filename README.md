@@ -22,9 +22,17 @@ sudo install -m 644 bt-bcm4377-fix/bt-bcm4377-rebind.service /etc/systemd/system
 sudo systemctl daemon-reload
 sudo systemctl enable --now bt-bcm4377-rebind.service
 
-# 2. Suspend
-sudo install -m 755 t2-suspend-fix/t2-wifi-suspend /usr/lib/systemd/system-sleep/t2-wifi-suspend
+# 2. Suspend (sleep.target service — not a systemd-sleep hook)
+sudo install -m 755 t2-suspend-fix/t2-wifi-suspend /usr/local/sbin/t2-wifi-suspend
+sudo install -m 644 t2-suspend-fix/t2-wifi-suspend.service /etc/systemd/system/t2-wifi-suspend.service
+sudo rm -f /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo systemctl daemon-reload
+sudo systemctl enable t2-wifi-suspend.service
 ```
+
+If you already have another `sleep.target` unit that unloads `brcmfmac` (for example
+`t2-brcmfmac-suspend.service`), disable it. Two resume paths will fight: one reloads
+Wi-Fi immediately, which hard-crashes this chip.
 
 ---
 
@@ -32,8 +40,10 @@ sudo install -m 755 t2-suspend-fix/t2-wifi-suspend /usr/lib/systemd/system-sleep
 
 ### Symptom
 
-- `bluetoothctl show` reports `Powered: no`.
-- `bluetoothctl power on` fails with `org.bluez.Error.Failed`.
+- `bluetoothctl show` reports `Powered: no`, **or** `Powered: yes` with
+  `Class: 0x00000000` while scans find nothing.
+- `bluetoothctl power on` fails with `org.bluez.Error.Failed`, or HCI commands time out
+  (`Opcode 0x0c56 failed: -110`).
 - `hci0` exists, rfkill is unblocked, driver and firmware are correctly loaded — Bluetooth
   just never comes up. Happens on every boot.
 
@@ -66,7 +76,9 @@ out. See `DIAGNOSIS.md` for the full investigation.
 ### Fix
 
 `bt-bcm4377-fix/`: a oneshot systemd service that retries the unbind/bind cycle (up to 5 times)
-after boot until bluez reports the controller powered on.
+after boot until the controller is actually usable. BlueZ reporting `Powered: yes` is not
+enough — a hung BCM4377 keeps that flag while the adapter class stays `0x00000000` and
+scans find nothing. The script treats an unset class as down and rebinds anyway.
 
 Install:
 
@@ -82,8 +94,11 @@ Verify:
 
 ```bash
 systemctl status bt-bcm4377-rebind
-bluetoothctl show | grep Powered
+bluetoothctl show | grep -E 'Powered|Class'
 ```
+
+`Powered: yes` with `Class: 0x00000000` still means the chip is hung. After a successful
+rebind the class is non-zero (for example `0x006c010c`).
 
 Rollback (remove the suspend fix first if installed, since it depends on this service):
 
@@ -129,15 +144,18 @@ that did not work.
 
 ### Fix
 
-`t2-suspend-fix/`: a systemd-sleep hook that:
+`t2-suspend-fix/`: a `sleep.target` oneshot (not a systemd-sleep hook) that:
 
-- **before sleep:** unloads `brcmfmac_wcc`, `brcmfmac` and `hci_bcm4377`.
+- **before `sleep.target`:** disconnects the Wi-Fi interface so NetworkManager releases it,
+  stops `bluetooth.service`, then unloads `hci_bcm4377`, `brcmfmac_wcc` and `brcmfmac`
+  (retrying the Wi-Fi unload). This has to run *before* user.slice is frozen — a
+  systemd-sleep hook is too late, and `modprobe -r brcmfmac` then fails.
 - **15 seconds after wake:** reloads `brcmfmac`, then starts `bt-bcm4377-rebind.service` from
   the Bluetooth fix to bring Bluetooth back up (retrying if the first probe times out).
 
 The delay matters: reloading Wi-Fi the instant the system wakes crashed the machine.
 
-**Requires the Bluetooth fix.** The hook unloads the Bluetooth driver before sleep and relies
+**Requires the Bluetooth fix.** The unit unloads the Bluetooth driver before sleep and relies
 on `bt-bcm4377-rebind.service` to reload it. Without that service, Bluetooth stays off after
 every wake until you reboot.
 
@@ -145,17 +163,22 @@ Install:
 
 ```bash
 cd omarchy-a2179-t2-bluetooth-suspend-fix/t2-suspend-fix
-sudo install -m 755 t2-wifi-suspend /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo install -m 755 t2-wifi-suspend /usr/local/sbin/t2-wifi-suspend
+sudo install -m 644 t2-wifi-suspend.service /etc/systemd/system/t2-wifi-suspend.service
+sudo rm -f /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo systemctl daemon-reload
+sudo systemctl enable t2-wifi-suspend.service
 ```
 
-No service to enable: systemd runs everything in `/usr/lib/systemd/system-sleep/` before
-sleep and after wake.
+If you previously installed the systemd-sleep hook from an earlier version of this repo,
+the `rm` line above is the migration. Leave that hook in place and it will race this
+service on resume.
 
 Verify: close the lid for a minute, open it, and wait about 40 seconds. Then:
 
 ```bash
 journalctl -b -k | grep -E 'PM: suspend|failed to suspend|AER|DPC' | tail
-journalctl -b -u t2-wifi-reload -u bt-bcm4377-rebind --no-pager | tail
+journalctl -b -u t2-wifi-suspend -u t2-wifi-reload -u bt-bcm4377-rebind --no-pager | tail
 ```
 
 Success is a `PM: suspend entry (deep)` / `PM: suspend exit` pair, with no `failed to suspend`
@@ -167,7 +190,10 @@ reconnects it, and Wi-Fi and Bluetooth are missing for about the first 30 to 40 
 Rollback:
 
 ```bash
-sudo rm /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo systemctl disable --now t2-wifi-suspend.service
+sudo rm /etc/systemd/system/t2-wifi-suspend.service /usr/local/sbin/t2-wifi-suspend
+sudo rm -f /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo systemctl daemon-reload
 ```
 
 Suspend goes back to never working. If Wi-Fi or Bluetooth ever dies after a wake, a reboot
@@ -190,8 +216,8 @@ full lid-close cycle so far (about 6 minutes of deep sleep), so treat it as earl
 
 Likely applies to other T2 Macs with the same BCM4377 chip (other 2020 MacBook Air/Pro
 models). The Bluetooth script finds the device by PCI vendor/device ID (`14e4:5fa0`), and the
-suspend hook only uses module names, so both should work unmodified even where the PCI
-address differs.
+suspend unit matches Wi-Fi by PCI ID `14e4:4488` then unloads by module name, so both should
+work unmodified even where the PCI address differs.
 
 ## Sources
 
