@@ -87,9 +87,18 @@ Tested by hand:
 This is why the shipped fix retries the unbind/bind cycle up to 5 times rather than
 doing it once.
 
-Known weakness: the script's "already powered" check trusts bluez, which can keep reporting
-`Powered: yes` while the chip has stopped responding. At boot this hasn't mattered. After
-suspend it did (see Part 2), which is why the suspend hook unloads the driver first.
+The script's "already powered" check used to trust bluez, which can keep reporting
+`Powered: yes` while the chip has stopped responding. At boot this mostly didn't matter. After
+suspend it did (see Part 2), which is why the suspend hook unloads the driver first — and it
+turned out to matter at boot as well on at least one other MacBookAir9,1, where the adapter
+came up with `Class: 0x00000000`, found zero devices on a scan, and the script exited deciding
+there was nothing to do.
+
+That check has been replaced. `powered()` now reads the `hci` index out of
+`/sys/bus/pci/devices/<dev>/bluetooth/` and runs `btmgmt --index <n> power on` followed by
+`btmgmt --index <n> info`, both under a 10-second timeout, requiring `current settings:` to
+contain `powered`. That goes through the kernel management socket rather than bluez's cached
+view, so a hung controller fails the check instead of passing it.
 
 ### If the Bluetooth fix doesn't work for you
 
@@ -186,7 +195,7 @@ to the whole chip. After that Wi-Fi still showed "connected" but passed no traff
 `brcmfmac` command timed out, Bluetooth scans found nothing, and unloading and reloading the
 drivers did not help. Only a reboot recovered it.
 
-### Working fix (v3)
+### v3: also unload the Bluetooth driver (superseded by v4)
 
 Unload the Bluetooth driver before sleep as well, so neither function has to survive suspend:
 
@@ -203,6 +212,57 @@ Verified: lid closed, about 6 minutes of deep sleep, lid opened. Afterward there
 or DPC errors, the Bluetooth rebind succeeded on its first attempt, Wi-Fi passed traffic, and
 a Bluetooth scan found 14 devices.
 
+That single cycle was the whole test, and it hid the next bug.
+
+### Working fix (v4): a named reload unit
+
+Over the following week Wi-Fi and Bluetooth kept coming back dead, roughly every other day
+(2026-09-14 13:13, 09-15 10:44, 09-16 19:22, 09-17 11:56). It looked like long suspends were
+the trigger. It wasn't. In each case the machine had woken briefly and been suspended again
+before the 15-second deferred reload finished, and the next resume logged:
+
+```
+Failed to start transient service unit: Unit t2-wifi-reload.timer was already loaded or has a fragment file
+```
+
+`systemd-run --unit=t2-wifi-reload` asks for one fixed name. Once a run from the previous wake
+was still registered under it, the `post` hook's attempt to schedule the next one failed
+outright, the reload never ran, and both radios stayed down until reboot. The transient unit
+was the bug; the sleep duration was a coincidence.
+
+v4 replaces it with an installed unit, which `systemctl restart` can always reuse:
+
+```ini
+# /etc/systemd/system/t2-wifi-reload.service
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 15
+ExecStart=/bin/sh -c 'modprobe brcmfmac; systemctl start bt-bcm4377-rebind.service'
+TimeoutStartSec=180
+```
+
+```bash
+pre)  timeout 20 systemctl stop t2-wifi-reload.service bt-bcm4377-rebind.service
+      systemctl reset-failed t2-wifi-reload.service bt-bcm4377-rebind.service
+      modprobe -r brcmfmac_wcc brcmfmac hci_bcm4377 ;;
+post) systemctl reset-failed t2-wifi-reload.service
+      systemctl restart --no-block t2-wifi-reload.service ;;
+```
+
+The `stop` in the `pre` phase is what keeps a reload from racing the module unload — without
+it, a reload firing mid-suspend reloads `brcmfmac` right as the hook is trying to remove it.
+The 20-second timeout is there because the rebind can block uninterruptibly in a sysfs
+bind/unbind write; when that happens the stop takes around 11 seconds and logs
+`Processes still around after SIGKILL. Ignoring`, which is survivable but makes suspend feel
+slow on a quick re-close.
+
+Verified over 11 suspend/resume cycles across four days of ordinary use, sleeps from 10
+seconds to 19 hours, including three wake/re-suspend pairs matching the original failure
+(09-20 17:25→17:26, 09-21 08:45→08:46, 09-21 16:45→16:45). Bluetooth powered on the first
+rebind attempt on every resume, with no `already loaded` line and no AER or DPC events. A
+`t2-wifi-reload.service: Failed with result 'signal'` at the moment of a re-close is expected:
+that is the `pre` hook stopping a reload it is about to invalidate.
+
 ### If the suspend fix doesn't work for you
 
 Check how far the cycle got:
@@ -216,9 +276,12 @@ journalctl -b -u t2-wifi-reload -u bt-bcm4377-rebind --no-pager
 - `failed to suspend` naming a device other than `brcmfmac`: something else also blocks D3 on
   your machine and needs the same unload/reload treatment.
 - `AER` / `DPC` from `73:00.x` after wake: one of the chip's functions resumed in a bad state.
-  Try a longer delay (raise `--on-active=15`).
-- Crash on wake with no logs: same as v1 above. Check the hook is installed and is the v3
-  version with the delay.
+  Try a longer delay (raise the `ExecStartPre=/bin/sleep 15` in `t2-wifi-reload.service`).
+- `Unit t2-wifi-reload.timer was already loaded or has a fragment file`: you are still on v2
+  or v3, which scheduled the reload with `systemd-run`. Install `t2-wifi-reload.service` and
+  the current hook.
+- Crash on wake with no logs: same as v1 above. Check the hook is installed and that the
+  reload is delayed rather than immediate.
 
 If you file upstream with [t2linux](https://github.com/t2linux), include:
 

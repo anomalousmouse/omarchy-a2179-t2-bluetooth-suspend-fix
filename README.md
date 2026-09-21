@@ -24,7 +24,12 @@ sudo systemctl enable --now bt-bcm4377-rebind.service
 
 # 2. Suspend
 sudo install -m 755 t2-suspend-fix/t2-wifi-suspend /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo install -m 644 t2-suspend-fix/t2-wifi-reload.service /etc/systemd/system/t2-wifi-reload.service
+sudo systemctl daemon-reload
 ```
+
+Upgrading from an earlier version of this repo? See [Version history](#version-history) for
+what changed and what to remove.
 
 ---
 
@@ -66,7 +71,13 @@ out. See `DIAGNOSIS.md` for the full investigation.
 ### Fix
 
 `bt-bcm4377-fix/`: a oneshot systemd service that retries the unbind/bind cycle (up to 5 times)
-after boot until bluez reports the controller powered on.
+after boot until the controller actually answers.
+
+"Actually answers" is the important part. The script used to ask bluez whether the adapter was
+powered, but bluez reports its own cached state, which stays `Powered: yes` while the HCI is
+hung — so the script would decide there was nothing to do and exit on a dead controller. It now
+derives the `hci` index from sysfs and drives `btmgmt power on` plus `btmgmt info` through the
+kernel management socket, so the controller has to respond before it is treated as up.
 
 Install:
 
@@ -129,13 +140,24 @@ that did not work.
 
 ### Fix
 
-`t2-suspend-fix/`: a systemd-sleep hook that:
+`t2-suspend-fix/`: a systemd-sleep hook plus the `t2-wifi-reload.service` unit it starts.
 
-- **before sleep:** unloads `brcmfmac_wcc`, `brcmfmac` and `hci_bcm4377`.
-- **15 seconds after wake:** reloads `brcmfmac`, then starts `bt-bcm4377-rebind.service` from
-  the Bluetooth fix to bring Bluetooth back up (retrying if the first probe times out).
+- **before sleep:** cancels any reload or rebind still running from an earlier wake, then
+  unloads `brcmfmac_wcc`, `brcmfmac` and `hci_bcm4377`.
+- **after wake:** starts `t2-wifi-reload.service`, which waits 15 seconds, reloads `brcmfmac`,
+  then starts `bt-bcm4377-rebind.service` from the Bluetooth fix to bring Bluetooth back up
+  (retrying if the first probe times out).
 
 The delay matters: reloading Wi-Fi the instant the system wakes crashed the machine.
+
+The reload being a real unit matters too. It used to be a transient `systemd-run` unit, which
+always reused one fixed name. If the machine woke and suspended again inside the 15 seconds —
+a glance at the screen, or a lid that doesn't latch — the next resume hit `Unit
+t2-wifi-reload.timer was already loaded or has a fragment file`, skipped the reload entirely,
+and left Wi-Fi *and* Bluetooth dead until a reboot. This looked like "long suspends break the
+radios" but had nothing to do with how long the machine slept. A named unit can always be
+restarted, and the pre-sleep hook stops an in-flight reload (bounded to 20 seconds) so it
+cannot race the module unload.
 
 **Requires the Bluetooth fix.** The hook unloads the Bluetooth driver before sleep and relies
 on `bt-bcm4377-rebind.service` to reload it. Without that service, Bluetooth stays off after
@@ -146,10 +168,13 @@ Install:
 ```bash
 cd omarchy-a2179-t2-bluetooth-suspend-fix/t2-suspend-fix
 sudo install -m 755 t2-wifi-suspend /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo install -m 644 t2-wifi-reload.service /etc/systemd/system/t2-wifi-reload.service
+sudo systemctl daemon-reload
 ```
 
-No service to enable: systemd runs everything in `/usr/lib/systemd/system-sleep/` before
-sleep and after wake.
+Nothing to `enable`. The hook runs because systemd runs everything in
+`/usr/lib/systemd/system-sleep/` before sleep and after wake, and the hook starts
+`t2-wifi-reload.service` itself. Enabling that unit would wrongly run it at boot.
 
 Verify: close the lid for a minute, open it, and wait about 40 seconds. Then:
 
@@ -161,6 +186,12 @@ journalctl -b -u t2-wifi-reload -u bt-bcm4377-rebind --no-pager | tail
 Success is a `PM: suspend entry (deep)` / `PM: suspend exit` pair, with no `failed to suspend`
 and no `AER` or `DPC` lines after it.
 
+Worth testing the awkward case too, since it is what broke earlier versions: close the lid,
+open it, close it again within about 10 seconds, then open it for good. The second wake should
+still bring both radios back, and the journal should contain no `already loaded` line. A
+`t2-wifi-reload.service: Failed with result 'signal'` entry at the moment of the re-close is
+expected — that is the pre-sleep hook stopping the reload it is about to invalidate.
+
 Expected after every wake: the keyboard lags for a second or two while the T2 bridge
 reconnects it, and Wi-Fi and Bluetooth are missing for about the first 30 to 40 seconds.
 
@@ -168,6 +199,8 @@ Rollback:
 
 ```bash
 sudo rm /usr/lib/systemd/system-sleep/t2-wifi-suspend
+sudo rm /etc/systemd/system/t2-wifi-reload.service
+sudo systemctl daemon-reload
 ```
 
 Suspend goes back to never working. If Wi-Fi or Bluetooth ever dies after a wake, a reboot
@@ -180,18 +213,72 @@ restores both.
 Confirmed on:
 
 - Model: `MacBookAir9,1` (2020 Intel, T2 chip, part number A2179)
-- OS: Omarchy (Arch), kernel `linux-t2` 7.2.4 (Bluetooth fix also on 7.1.8)
+- OS: Omarchy (Arch), kernel `linux-t2` 7.2.6 (also run on 7.2.4; Bluetooth fix also on 7.1.8)
 - Chip: Broadcom BCM4377b combo, Wi-Fi at PCI `0000:73:00.0`, Bluetooth at `0000:73:00.1`
 - `apple-bcm-firmware` 14.0-1, bluez 5.87-2
 - Kernel parameters from Omarchy's T2 installer: `intel_iommu=on iommu=pt pm_async=off mem_sleep_default=deep`
 
-The Bluetooth fix has worked on every boot since install. The suspend fix has been tested on one
-full lid-close cycle so far (about 6 minutes of deep sleep), so treat it as early.
+The Bluetooth fix has worked on every boot since install. The suspend fix, at the current
+version, has been through 11 suspend/resume cycles over four days of ordinary lid-closed use,
+ranging from 10 seconds to 19 hours of sleep, including three quick re-suspends of the kind
+that broke the previous version. Bluetooth came back on the first rebind attempt every time,
+with no `AER` or `DPC` events and no skipped reloads.
 
 Likely applies to other T2 Macs with the same BCM4377 chip (other 2020 MacBook Air/Pro
 models). The Bluetooth script finds the device by PCI vendor/device ID (`14e4:5fa0`), and the
 suspend hook only uses module names, so both should work unmodified even where the PCI
 address differs.
+
+## Version history
+
+Only the current version is shipped in this repo. The earlier ones are described here because
+the approaches they used are the ones people are most likely to reach for, and each was
+abandoned for a concrete reason. `DIAGNOSIS.md` has the full logs.
+
+### v4 — current
+
+- **Replaced:** the transient `systemd-run --collect --on-active=15 --unit=t2-wifi-reload`
+  call in the hook's `post` phase, with an installed `t2-wifi-reload.service`
+  (`Type=oneshot`, `ExecStartPre=/bin/sleep 15`) that the hook restarts.
+  A transient unit reuses one fixed name, so a wake followed by another suspend inside the
+  15-second window left the name taken. The next resume failed with `Unit
+  t2-wifi-reload.timer was already loaded or has a fragment file`, skipped the reload, and
+  left both radios down until reboot. This is the "Wi-Fi and Bluetooth don't come back after
+  multiple suspends" bug.
+- **Added:** the pre-sleep hook now runs `timeout 20 systemctl stop` on the reload and rebind
+  units, then `reset-failed`, so a reload still in flight cannot race the module unload.
+- **Replaced:** `bt-bcm4377-rebind`'s "already powered" check. It asked bluez, which caches
+  `Powered: yes` across a hung controller and made the script exit without doing anything. It
+  now resolves the `hci` index from sysfs and drives `btmgmt power on` and `btmgmt info`
+  through the kernel management socket, so the controller must answer.
+- **New file:** `t2-suspend-fix/t2-wifi-reload.service`. Upgrading from v3 means installing it
+  and running `systemctl daemon-reload`; the old transient unit needs no cleanup, it was never
+  on disk.
+
+Known rough edge: the rebind can sit in an uninterruptible sysfs bind/unbind write, so the
+pre-sleep stop occasionally takes around 11 seconds and survives `SIGKILL`
+(`Processes still around after SIGKILL. Ignoring`). That is inside the 20-second budget and
+the cycle still completes correctly, but it is why suspend can feel sluggish on a quick
+re-close.
+
+### v3 — superseded
+
+Unloaded `hci_bcm4377` alongside `brcmfmac_wcc` and `brcmfmac` before sleep, and deferred the
+reload by 15 seconds with a transient `systemd-run` unit. Correct on a single sleep cycle,
+which is all it had been tested on. The transient unit is what v4 replaces.
+
+### v2 — removed
+
+Deferred the Wi-Fi reload by 15 seconds but left `hci_bcm4377` loaded through suspend. The
+Bluetooth function woke hung and about a minute later raised an uncorrectable PCIe error;
+Downstream Port Containment then cut the link to the whole chip, taking Wi-Fi with it until
+reboot.
+
+### v1 — removed
+
+Reloaded `brcmfmac` immediately in the hook's `post` phase. The machine reached the lock
+screen after wake and then hard-crashed and rebooted, leaving nothing in the journal or
+pstore.
 
 ## Sources
 
