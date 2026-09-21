@@ -12,7 +12,19 @@
 # Stop bluetoothd first so the module can actually leave.
 #
 # Reloading brcmfmac the instant the system wakes has hard-crashed this model.
-# Defer that reload ~15s, then rebind Bluetooth.
+# Defer that reload ~15s, then rebind Bluetooth. The deferred work runs as the
+# installed unit t2-wifi-reload.service, never a transient systemd-run unit: a
+# transient unit reuses one fixed name, so a wake followed by another suspend
+# inside the 15s window left the name taken and the next resume failed with
+# "Unit t2-wifi-reload.timer was already loaded or has a fragment file". The
+# reload was then skipped entirely and both radios stayed down until reboot.
+#
+# For the same reason `pre` cancels a reload still in flight. Without that, a
+# reload firing mid-suspend re-loads brcmfmac exactly as this script is trying
+# to remove it.
+
+RELOAD_UNIT=t2-wifi-reload.service
+REBIND_UNIT=bt-bcm4377-rebind.service
 
 has_bcm4377b() {
   local dev
@@ -47,6 +59,15 @@ release_wifi() {
   done
 }
 
+# Cancel a deferred reload or a rebind left over from an earlier wake, so
+# neither can race the unload below. Bounded, so a stuck unit cannot hold up
+# the suspend indefinitely: the rebind can block uninterruptibly in a sysfs
+# bind/unbind write and survive SIGKILL for several seconds.
+cancel_resume_work() {
+  timeout 20 systemctl stop "$RELOAD_UNIT" "$REBIND_UNIT" >/dev/null 2>&1 || true
+  systemctl reset-failed "$RELOAD_UNIT" "$REBIND_UNIT" >/dev/null 2>&1 || true
+}
+
 unload_bluetooth() {
   loaded hci_bcm4377 || return 0
   systemctl stop bluetooth.service >/dev/null 2>&1 || true
@@ -60,6 +81,8 @@ unload_bluetooth() {
 
 pre() {
   has_bcm4377b || exit 0
+
+  cancel_resume_work
 
   unload_bluetooth
 
@@ -84,9 +107,10 @@ pre() {
 post() {
   has_bcm4377b || exit 0
 
-  systemctl stop t2-wifi-reload.service t2-wifi-reload.timer >/dev/null 2>&1 || true
-  systemd-run --collect --on-active=15s --unit=t2-wifi-reload \
-    /bin/bash -c 'modprobe brcmfmac; modprobe brcmfmac_wcc || true; systemctl start bt-bcm4377-rebind.service'
+  # A named unit can always be restarted, even if the previous run is still
+  # registered, so a quick wake/re-suspend cycle cannot wedge the reload.
+  systemctl reset-failed "$RELOAD_UNIT" >/dev/null 2>&1 || true
+  systemctl restart --no-block "$RELOAD_UNIT"
   echo "scheduled brcmfmac/bluetooth reload in 15s"
 }
 

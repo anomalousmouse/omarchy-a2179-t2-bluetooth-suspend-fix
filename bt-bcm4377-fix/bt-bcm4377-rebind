@@ -1,12 +1,13 @@
 #!/bin/bash
 # Workaround for BCM4377 Bluetooth on T2 Macs (MacBookAir9,1 and similar).
 # The chip's Bluetooth firmware often fails its first initialisation after boot
-# (HCI command timeouts, or probe error -110). Unbinding and rebinding the
-# hci_bcm4377 PCI driver, sometimes more than once, brings it up.
+# or after resume (HCI command timeouts, or probe error -110). Unbinding and
+# rebinding the hci_bcm4377 PCI driver, sometimes more than once, brings it up.
 #
-# Exit 0 as soon as the controller is actually usable. BlueZ can report
-# Powered: yes while HCI commands time out and the adapter class stays
-# 0x00000000 — that happens at boot, not only after suspend.
+# Exit 0 as soon as the controller answers a real HCI round trip. BlueZ is not
+# a reliable witness here: it reports Powered: yes from its own cached state
+# while HCI commands time out and the adapter class stays 0x00000000, and that
+# happens at boot, not only after suspend.
 
 set -u
 
@@ -28,15 +29,23 @@ fi
 
 modprobe hci_bcm4377 2>/dev/null || true
 
-# Returns 0 only if BlueZ says powered *and* the adapter class is set.
-# A hung BCM4377 still reports Powered: yes with Class: 0x00000000 (0).
+# Ask the kernel, not bluez. btmgmt talks over the management socket, so a hung
+# controller fails to answer instead of reporting stale "powered" state. The
+# adapter class is checked as well: a BCM4377 that has half-initialised comes
+# back powered but with class 0x00000000 and finds nothing on a scan.
 alive() {
-    [ -e /sys/class/bluetooth/hci0 ] || return 1
-    timeout 5 bluetoothctl power on >/dev/null 2>&1 || true
-    local show
-    show=$(timeout 5 bluetoothctl show 2>/dev/null) || return 1
-    echo "$show" | grep -q 'Powered: yes' || return 1
-    echo "$show" | grep -q 'Class: 0x00000000' && return 1
+    local hci idx info
+    hci=$(ls "/sys/bus/pci/devices/$DEV/bluetooth" 2>/dev/null | head -n1)
+    [ -n "$hci" ] || return 1
+    idx=${hci#hci}
+
+    timeout 10 btmgmt --index "$idx" power on >/dev/null 2>&1 || return 1
+    info=$(timeout 10 btmgmt --index "$idx" info 2>/dev/null) || return 1
+
+    echo "$info" | grep -q 'current settings:.*powered' || return 1
+    # btmgmt prints this on the addr line as e.g. "class 0x6c010c"; a chip that
+    # came up half-initialised reports "class 0x000000".
+    echo "$info" | grep -q 'class 0x000000' && return 1
     return 0
 }
 

@@ -7,8 +7,10 @@ StopWhenUnneeded=yes
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-TimeoutStartSec=15
-TimeoutStopSec=15
+# pre can spend up to 20s cancelling an in-flight reload (the rebind can sit
+# in an uninterruptible sysfs write) before it even starts unloading modules.
+TimeoutStartSec=60
+TimeoutStopSec=30
 SyslogIdentifier=t2-wifi-suspend
 ExecStart=/usr/local/sbin/t2-wifi-suspend pre
 ExecStop=/usr/local/sbin/t2-wifi-suspend post

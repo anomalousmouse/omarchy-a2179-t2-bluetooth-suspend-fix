@@ -1,0 +1,17 @@
+[Unit]
+Description=Reload BCM4377 Wi-Fi and rebind Bluetooth after resume
+Documentation=https://github.com/austinsomer/omarchy-a2179-t2-bluetooth-suspend-fix
+# Started only by t2-wifi-suspend.service on resume; not enabled at boot.
+# Deliberately an installed unit rather than a transient systemd-run one: a
+# transient unit reuses a single fixed name, which a quick wake/re-suspend
+# cycle leaves taken ("already loaded or has a fragment file"), silently
+# skipping the reload and leaving Wi-Fi and Bluetooth down until reboot.
+
+[Service]
+Type=oneshot
+SyslogIdentifier=t2-wifi-reload
+# The instant reload after wake crashed the machine; wait for the PCIe link
+# and the T2 bridge to settle first. 15s matches the delay that tested clean.
+ExecStartPre=/bin/sleep 15
+ExecStart=/bin/bash -c 'modprobe brcmfmac; modprobe brcmfmac_wcc || true; systemctl start bt-bcm4377-rebind.service'
+TimeoutStartSec=180
