@@ -1,0 +1,11 @@
+[Unit]
+Description=Reload BCM4377 Wi-Fi and rebind Bluetooth after resume
+# Started only by the t2-wifi-suspend sleep hook; not enabled at boot.
+
+[Service]
+Type=oneshot
+# The instant reload after wake crashed the machine; wait for the PCIe link
+# and the T2 bridge to settle first. 15s matches the delay that tested clean.
+ExecStartPre=/bin/sleep 15
+ExecStart=/bin/sh -c 'modprobe brcmfmac; systemctl start bt-bcm4377-rebind.service'
+TimeoutStartSec=180

@@ -1,10 +1,10 @@
 #!/bin/bash
 # Workaround for BCM4377 Bluetooth on T2 Macs (MacBookAir9,1 and similar).
 # The chip's Bluetooth firmware often fails its first initialisation after boot
-# (HCI command timeouts, or probe error -110). Unbinding and rebinding the
-# hci_bcm4377 PCI driver, sometimes more than once, brings it up.
+# or after resume (HCI command timeouts, or probe error -110). Unbinding and
+# rebinding the hci_bcm4377 PCI driver, sometimes more than once, brings it up.
 #
-# Exit 0 as soon as bluez reports the controller powered on.
+# Exit 0 as soon as the controller answers a real HCI round trip.
 
 set -u
 
@@ -26,10 +26,18 @@ fi
 
 modprobe hci_bcm4377 2>/dev/null || true
 
+# bluetoothctl reports "Powered: yes" from cached bluez state, which stays true
+# while the controller is hung, so this drives a command through the kernel
+# mgmt socket and requires the controller to answer.
 powered() {
-    [ -e /sys/class/bluetooth/hci0 ] || return 1
-    timeout 5 bluetoothctl power on >/dev/null 2>&1
-    timeout 5 bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'
+    local hci idx
+    hci=$(ls "/sys/bus/pci/devices/$DEV/bluetooth" 2>/dev/null | head -n1)
+    [ -n "$hci" ] || return 1
+    idx=${hci#hci}
+
+    timeout 10 btmgmt --index "$idx" power on >/dev/null 2>&1 || return 1
+    timeout 10 btmgmt --index "$idx" info 2>/dev/null |
+        grep -q 'current settings:.*powered'
 }
 
 if powered; then
